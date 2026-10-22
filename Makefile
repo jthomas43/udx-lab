@@ -11,11 +11,14 @@ PERF_CFLAGS = -O2 -g -Wall -Werror
 
 qdxperf: build/qdxperf
 
+tags: $(LIB_SRC) $(TEST_SRC) *.h
+	ctags -R
+
 build/qdxperf: programs/qdxperf.c $(LIB_SRC) *.h
 	@mkdir -p $(@D)
 	gcc $(PERF_CFLAGS) $(LIB_SRC) $< -o $@
 
-build/test/%: test/%.c $(LIB_SRC) *.h
+build/test/%: test/%.c $(LIB_SRC) *.h test/*.h
 	@mkdir -p $(@D)
 	gcc $(CFLAGS) $(LIB_SRC) $< -o $@
 

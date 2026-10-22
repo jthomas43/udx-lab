@@ -20,6 +20,7 @@ write_t reader_end;
 bool timed_out;
 bool reader_end_acked;
 bool writer_end_acked;
+size_t bytes_read;
 
 event_t timer;
 
@@ -31,6 +32,16 @@ byte_buf_t buf_from_string(char *s) {
     return buf_init((uint8_t *)s, strlen(s));
 }
 
+static void on_read(stream_t *stream, uint8_t *bytes, ssize_t status, bool end) {
+    assert(status >= 0);
+    if (status > 0) {
+        size_t len = status;
+        printf("read '%.*s' (%ld bytes) %s\n", (int)len, bytes, len, end ? "(END)" : "");
+        bytes_read += len;
+    }
+}
+typedef void (*stream_read_cb)(stream_t *stream, uint8_t *bytes, ssize_t status, bool end);
+
 static void on_ack(write_t *w, uint64_t offset, int status) {
     stream_t *stream = w->stream;
     if (stream == reader) {
@@ -40,12 +51,11 @@ static void on_ack(write_t *w, uint64_t offset, int status) {
         writer_end_acked = true;
     }
 
-    printf("stream=%s status=%d\n", stream == reader ? "reader" : "writer", status);
-
     if (reader_end_acked && writer_end_acked) {
         loop.terminate = true;
     }
 }
+
 int main(int argc, char **argv) {
     loop_init(&loop);
 
@@ -74,6 +84,8 @@ int main(int argc, char **argv) {
     assert(writer != NULL);
     reader = stream_create(recv_sock, 1, 0, (sockaddr_t *)&send_addr, NULL);
     assert(reader != NULL);
+
+    reader->user_read = on_read;
 
     write_t w[2];
 

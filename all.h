@@ -108,6 +108,16 @@ struct socket_s {
 #define HEADER_MAX_DATA 0x40
 #define HEADER_DATA_BLOCKED 0x80
 
+#define PROTO_DATA_HEADER_SIZE 24 // with data_offset
+
+// max udp payload. 1200 is quic's minimum, safe on almost any path
+#define PROTO_MAX_PACKET 1200
+#define PROTO_MAX_DATA (PROTO_MAX_PACKET - PROTO_DATA_HEADER_SIZE)
+
+// every packet advertises the sender's receive window after its sacks:
+// HEADER_MAX_DATA and the offset the peer may send up to
+#define PROTO_MAX_DATA_FIELD_SIZE 8
+
 typedef struct packet_s packet_t;
 // this is a data packet in particular -
 // packets without data will not have the data_offset field
@@ -127,9 +137,19 @@ struct packet_s {
     } u;
 
     bool lost;
-    uint16_t len; // data bytes after the header
-    uint64_t sent_ts;
-    chain_t *chain; // write_queue link holding data_offset
+    uint16_t len;     // data bytes after the header
+    uint64_t send_ts; // (scheduled) send time
+    chain_t *chain;   // write_queue link holding data_offset
+
+    // bbr per-packet info (that isn't redundant with info already recorded)
+    struct {
+        uint64_t delivered_bytes;
+        uint64_t lost_bytes;
+        uint64_t delivered_ts;
+        uint64_t first_send_ts; // start of send epoch
+        bool is_app_limited;
+        uint64_t tx_in_flight_bytes;
+    } P;
 
     // stream->inflight, in data offset order. a retransmit reuses the packet,
     // so it keeps its place. next also links stream->free_packets
@@ -137,33 +157,32 @@ struct packet_s {
     packet_t **pprev;
 };
 
+typedef struct {
+    uint64_t delivered_bytes;
+    uint64_t delivery_rate; // bytes/sec
+    uint32_t rtt_us;
+    uint64_t new_acked_bytes;    // # of bytes acked by the packet generating this sample
+    uint64_t new_lost_bytes;     // # of bytes marked lost by the packet generating this sample
+    uint64_t tx_in_flight_bytes; // inflight_bytes at time of transmission of the packet that has just been acked
+    uint64_t lost_bytes;         // # of bytes lost during the rtt measured by this sample
+
+    // from the newest packet acked, set by rate_sample_update
+    bool has_data;
+    bool is_app_limited;
+    uint64_t prior_delivered_bytes; // P.delivered_bytes
+    uint64_t prior_lost_bytes;      // P.lost_bytes
+    uint64_t prior_ts;              // P.delivered_ts
+    uint32_t send_elapsed_us;
+    uint32_t ack_elapsed_us;
+    uint32_t interval_us; // max of send_elapsed_us and ack_elapsed_us
+    uint32_t last_acked_pnum;
+} rate_sample_t;
+
 // the header is sent by casting packet_t, so the wire format is the struct's
 // native layout
 _Static_assert(sizeof(((packet_t *)0)->u.hdr) == 24, "header has padding");
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
                "wire format is little endian");
-
-// typedef enum {
-//     FRAME_TYPE_UNUSED,
-//     FRAME_TYPE_DATA,
-//     FRAME_TIME_MAX_DATA
-// } frame_type_t;
-//
-// typedef struct {
-//     uint64_t len;
-//     uint64_t offset;
-// } data_frame_t;
-//
-// // data is stored in a doubly-linked list of frames
-// typedef struct {
-//     queue_t queue;
-//     frame_type_t type;
-//
-//     chain_t *data;
-//     union {
-//         data_frame_t data;
-//     } u;
-// } frame_t;
 
 // circular buffer of packet pointers, indexed by pnum - pbuf.c. packets
 // don't move when it grows
@@ -247,8 +266,13 @@ struct stream_s {
     uint64_t snd_max_offset;     // remotes max offset advertised
 
     uint32_t rcv_minimum_pnum;
-    uint32_t snd_inflight; // currently in flight (packets)
-    uint32_t max_inflight; // cwnd (packets)
+    uint32_t snd_inflight;   // currently in flight (packets)
+    uint64_t inflight_bytes; // payload bytes in flight, excludes headers, sacks and lost packets
+    uint32_t max_inflight;   // cwnd (packets)
+
+    bool is_max_inflight_limited; // true if the conection has hit max_inflight in now-rtt
+    uint64_t snd_next_ts_nanoseconds; // pacing: when the next data packet may leave
+    uint32_t snd_quantum;             // pacing: packets that may leave back to back
 
     send_state_t send_state;
     recv_state_t recv_state;
@@ -256,15 +280,22 @@ struct stream_s {
     pbuf_t packets;
     // queue_t frames;
 
-    packet_t *inflight; // ordered by data offset!
+    packet_t *inflight_queue; // ordered by data offset!
     packet_t **plast_inflight;
     packet_t *free_packets; // linked by next
 
     event_t push; // nginx: qc->push. all sending happens in its handler
     event_t pto;
 
-    uint32_t delivered;
-    uint32_t lost;
+    uint32_t delivered;       // packets acked
+    uint32_t lost;            // packets marked lost
+    uint64_t delivered_bytes; // payload bytes acked
+    uint64_t lost_bytes;      // payload bytes marked lost
+
+    // delivery rate sampling, bbr draft 4.1.2.1.1
+    uint64_t delivered_ts;  // when delivered_bytes last grew
+    uint64_t first_send_ts; // send_ts of the newest packet acked, or of the first sent after idle
+    uint64_t app_limited;   // delivered_bytes + inflight_bytes when marked app limited, 0 if not
 
     uint8_t *rcv_buf;
     uint32_t rcv_buf_size; // rwnd (bytes)
@@ -288,9 +319,90 @@ struct stream_s {
     uint32_t srtt_us;
     uint32_t rttvar_us;
     uint32_t latest_rtt_us;
+    uint32_t min_rtt_us; // over the stream's lifetime, 0 until the first sample
     uint32_t pto_us;
-    uint32_t pto_count; // ptos since the last ack of new data, for backoff
+    uint32_t pto_count;   // ptos since the last ack of new data, for backoff
     uint64_t snd_last_ts; // when the last data packet went out
+
+    struct {
+        enum { BBR_STARTUP,
+               BBR_DRAIN,
+               BBR_PROBE_BW_DOWN,
+               BBR_PROBE_BW_CRUISE,
+               BBR_PROBE_BW_REFILL,
+               BBR_PROBE_BW_UP,
+               BBR_PROBE_RTT } state;
+        double pacing_gain;
+        double max_inflight_gain; // cwnd_gain
+        int round_count;
+        bool round_start;
+        uint64_t next_round_delivered; // P.delivered_bytes at the end of an rtt
+        bool is_idle_restart;
+        int drain_start_round;
+
+        uint64_t max_inflight_bytes; // cwnd (bytes). stream->max_inflight is this in packets
+        uint64_t pacing_rate;        // bytes/sec, C.pacing_rate. stream.c paces with it
+
+        // bw fields are all bytes/sec
+        uint64_t max_bw;
+        uint64_t bw_shortterm;
+        uint64_t bw;
+
+        uint32_t min_rtt_us; // UINT32_MAX until the first sample
+        uint64_t bdp;
+        uint32_t extra_acked;
+        uint64_t max_inflight;
+        uint64_t inflight_longterm;  // UINT64_MAX when unset
+        uint64_t inflight_shortterm; // UINT64_MAX when unset
+        uint64_t prior_cwnd;         // saved over ProbeRTT
+
+        uint64_t bw_latest;       // 1-rtt max of RS.delivery_rate
+        uint64_t inflight_latest; // 1-rtt max of RS.delivered
+        uint64_t loss_round_delivered;
+        bool loss_round_start;
+        int loss_events_in_round; // discontiguous lost ranges, for leaving startup
+        uint32_t last_lost_pnum;
+
+        uint64_t max_bw_filter[2]; // windowed max-filter of RS.delivery_rate
+        int cycle_count;
+
+        // uint64_t extra_acked_interval_start_ts; //
+        // uint64_t extra_acked_delivered;
+        // uint64_t extra_acked[2]; // max-filter
+
+        // startup
+        bool full_bw_reached;
+        bool full_bw_now;
+        uint64_t full_bw; // bytes/sec
+        int full_bw_count;
+        // probe bw
+        enum { ACK_INIT,
+               ACK_REFILLING,
+               ACK_PROBE_STARTING,
+               ACK_PROBE_FEEDBACK,
+               ACK_PROBE_STOPPING } ack_phase;
+        bool is_bw_probe_sample;
+        bool is_loss_in_round;
+        uint64_t bw_probe_up_acked;
+        uint64_t bw_probe_up_acked_per_inc;
+        int bw_probe_up_rounds;
+        int rounds_since_bw_probe_up;
+        uint32_t bw_probe_wait_us;
+        uint64_t bw_probe_start_ts;
+        bool prev_bw_probe_too_high;
+        bool prev_bw_probe_precautionary;
+
+        // undo state omitted for now
+
+        uint64_t min_rtt_ts; // time current min_rtt was found
+
+        uint32_t probe_rtt_min_delay_us;
+        uint64_t probe_rtt_min_delay_ts;
+
+        bool is_probe_rtt_expired;
+        uint64_t probe_rtt_done_ts;
+        bool probe_rtt_round_done;
+    } bbr;
 
     stream_read_cb user_read;
     void *data; // the user's
@@ -337,6 +449,7 @@ int socket_send(socket_t *sock, sockaddr_t *dst, byte_buf_t b);
 void socket_close(socket_t *socket);
 void stream_close(stream_t *stream);
 
+void time_update();
 void timer_start(event_t *ev, uint32_t timer_us);
 void timer_stop(event_t *ev);
 void event_post(event_t *ev);
@@ -374,4 +487,10 @@ packet_t *pbuf_remove(pbuf_t *p, uint32_t pnum);
 
 byte_buf_t buf_init(uint8_t *p, size_t len);
 
+// bbr
+void bbr_init(stream_t *stream);
+void bbr_on_resume_from_idle(stream_t *stream);
+void bbr_congestion_control(stream_t *stream, rate_sample_t *rs);
+void bbr_on_packet_lost(stream_t *stream, packet_t *pkt);
+void bbr_check_app_limited(stream_t *stream);
 #endif

@@ -51,8 +51,6 @@ static void on_ack(write_t *wr, uint64_t offset, int status) {
         writer_acked_ts = now_ts;
     }
 
-    printf("stream=%s status=%d\n", stream == reader ? "reader" : "writer", status);
-
     if (reader_end_acked && writer_end_acked) {
         loop.terminate = true;
     }

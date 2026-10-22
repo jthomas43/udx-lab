@@ -119,18 +119,19 @@ static void event_expire_timers() {
     }
 }
 
-static uint32_t gettime_us() {
+// 64 bits, so now_ts doesn't wrap. timers keep 32-bit keys and compare
+// (int32_t)(key - now_ts), which only looks at the low bits
+static uint64_t gettime_us() {
     struct timespec ts;
     int rc = clock_gettime(CLOCK_MONOTONIC, &ts);
     assert(rc == 0);
 
-    time_t sec = ts.tv_sec;
-    uint32_t usec = ts.tv_nsec / 1000;
-
-    return (uint32_t)sec * 1000000 + usec;
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static void time_update() { now_ts = gettime_us(); }
+// once per loop pass, when epoll returns. handlers that need the time an
+// event really happened call it again, e.g. per packet sent or read
+void time_update() { now_ts = gettime_us(); }
 
 // nginx: ngx_get_connection
 socket_t *get_socket(loop_t *loop, int fd) {

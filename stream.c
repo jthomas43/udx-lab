@@ -10,12 +10,7 @@
 #include <unistd.h>
 
 #define PROTO_MIN_HEADER_SIZE 16
-#define PROTO_DATA_HEADER_SIZE 24 // with data_offset
 #define PROTO_VERSION 3
-
-// max udp payload. 1200 is quic's minimum, safe on almost any path
-#define PROTO_MAX_PACKET 1200
-#define PROTO_MAX_DATA (PROTO_MAX_PACKET - PROTO_DATA_HEADER_SIZE)
 
 // max write buffers one packet's data can span
 #define PUSH_MAX_IOV 8
@@ -35,6 +30,7 @@ static void stream_write_handler(event_t *wev);
 static void stream_push_handler(event_t *ev);
 static void stream_pto_handler(event_t *ev);
 static void stream_set_pto(stream_t *stream);
+static void pacing_on_send(stream_t *stream, size_t len);
 static int fill_acks(stream_t *stream, packet_t *pkt, sack_t *sacks, int max);
 
 // local is the address the peer sent to (from packet_info_t). if NULL, bind
@@ -167,6 +163,7 @@ stream_t *stream_create(socket_t *usock, uint32_t id, uint32_t remote_id, sockad
 
     // the implicit initial window both sides assume
     stream->rcv_max_offset = stream->rcv_buf_size;
+    stream->snd_max_offset = STREAM_RCV_BUF_SIZE;
 
     if (stream->rcv_buf == NULL) {
         socket_close(sock);
@@ -181,7 +178,7 @@ stream_t *stream_create(socket_t *usock, uint32_t id, uint32_t remote_id, sockad
     stream->pto.data = sock;
     stream->pto.handler = stream_pto_handler;
 
-    stream->max_inflight = 32; // hard code max inflight for now to skip implementing congestion control
+    bbr_init(stream);
 
     // after the last failure point, so a failed create never leaves an
     // entry pointing into a freed pool
@@ -193,8 +190,8 @@ stream_t *stream_create(socket_t *usock, uint32_t id, uint32_t remote_id, sockad
 
     stream->pto_us = 200000; // 200ms
 
-    stream->inflight = NULL;
-    stream->plast_inflight = &stream->inflight;
+    stream->inflight_queue = NULL;
+    stream->plast_inflight = &stream->inflight_queue;
 
     return stream;
 }
@@ -225,6 +222,9 @@ static int stream_write_internal(write_t *w, stream_t *stream, byte_buf_t b, boo
     if (stream->send_state != SEND_STATE_ESTABLISHED) {
         return ERR;
     }
+
+    // before the new data is queued: had the stream run out?
+    bbr_check_app_limited(stream);
 
     memset(w, 0, sizeof(*w));
     w->on_ack = on_ack;
@@ -280,20 +280,22 @@ static void stream_send_ack(stream_t *stream) {
 
     pkt.u.hdr.magic = 0xff;
     pkt.u.hdr.version = PROTO_VERSION;
-    pkt.u.hdr.flags = 0;
+    pkt.u.hdr.flags = HEADER_MAX_DATA;
     pkt.u.hdr.id = stream->remote_id;
     pkt.u.hdr.pnum = stream->snd_next_pnum;
 
     int nsacks = fill_acks(stream, &pkt, sacks, MAX_SACKS);
+    uint64_t max_data = stream->rcv_max_offset;
 
-    struct iovec iov[2] = {
+    struct iovec iov[3] = {
         {.iov_base = pkt.u.b, .iov_len = PROTO_MIN_HEADER_SIZE},
         {.iov_base = sacks, .iov_len = nsacks * sizeof(sack_t)},
+        {.iov_base = &max_data, .iov_len = PROTO_MAX_DATA_FIELD_SIZE},
     };
 
     struct msghdr msg = {
         .msg_iov = iov,
-        .msg_iovlen = 2,
+        .msg_iovlen = 3,
     };
 
     for (;;) {
@@ -347,16 +349,8 @@ static void packet_free(stream_t *stream, packet_t *pkt) {
     stream->free_packets = pkt;
 }
 
-// new data has the highest offset yet, so it goes at the tail
-static void inflight_append(stream_t *stream, packet_t *pkt) {
-    pkt->next = NULL;
-    pkt->pprev = stream->plast_inflight;
-    *stream->plast_inflight = pkt;
-    stream->plast_inflight = &pkt->next;
-}
-
 static void inflight_unlink(stream_t *stream, packet_t *pkt) {
-    bool head = pkt->pprev == &stream->inflight;
+    bool head = pkt->pprev == &stream->inflight_queue;
 
     *pkt->pprev = pkt->next;
 
@@ -369,8 +363,8 @@ static void inflight_unlink(stream_t *stream, packet_t *pkt) {
     // the head holds the lowest unacked offset. with nothing held, everything
     // sent is acked
     if (head) {
-        stream->snd_unacked_offset = stream->inflight
-                                         ? stream->inflight->u.hdr.data_offset
+        stream->snd_unacked_offset = stream->inflight_queue
+                                         ? stream->inflight_queue->u.hdr.data_offset
                                          : stream->snd_next_offset;
     }
 }
@@ -385,9 +379,13 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
                                        uint64_t offset, size_t limit,
                                        packet_t *rtx) {
     socket_t *sock = stream->sock;
-    struct iovec iov[2 + PUSH_MAX_IOV];
+    struct iovec iov[3 + PUSH_MAX_IOV];
     sack_t sacks[MAX_SACKS];
     packet_t pkt = {0};
+    uint64_t max_data = stream->rcv_max_offset;
+
+    // bbr draft 5.2.2 OnTransmit
+    bbr_on_resume_from_idle(stream);
 
     // only a bare END, or its retransmit, has no data
     assert(limit > 0 || stream->send_state == SEND_STATE_END_QUEUED ||
@@ -399,8 +397,8 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
     int max_sacks = MAX_SACKS;
 
     if (retransmit) {
-        assert(limit <= PROTO_MAX_DATA - sizeof(sack_t));
-        size_t fit = (PROTO_MAX_DATA - limit) / sizeof(sack_t);
+        assert(limit <= PROTO_MAX_DATA - PROTO_MAX_DATA_FIELD_SIZE - sizeof(sack_t));
+        size_t fit = (PROTO_MAX_DATA - PROTO_MAX_DATA_FIELD_SIZE - limit) / sizeof(sack_t);
 
         if (fit < MAX_SACKS) {
             max_sacks = fit;
@@ -412,16 +410,17 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
     // room for one sack is always kept, so any packet can be retransmitted
     // with at least one. a nonzero ack with no sacks would read as
     // everything below it acked
-    size_t room = PROTO_MAX_DATA - (nsacks ? nsacks : 1) * sizeof(sack_t);
+    size_t room = PROTO_MAX_DATA - PROTO_MAX_DATA_FIELD_SIZE -
+                  (nsacks ? nsacks : 1) * sizeof(sack_t);
     size_t len = limit < room ? limit : room;
 
-    // iov[0] is the header, iov[1] the sacks
-    int niov = 2;
+    // iov[0] is the header, iov[1] the sacks, iov[2] the receive window
+    int niov = 3;
     size_t skip = chain ? offset - chain->offset : 0;
     size_t left = len;
     chain_t *first = NULL;
 
-    for (chain_t *cl = chain; cl && left && niov < 2 + PUSH_MAX_IOV;
+    for (chain_t *cl = chain; cl && left && niov < 3 + PUSH_MAX_IOV;
          cl = cl->next, skip = 0) {
         size_t n = cl->buf->last - cl->buf->start - skip;
 
@@ -452,7 +451,7 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
 
     pkt.u.hdr.magic = 0xff;
     pkt.u.hdr.version = PROTO_VERSION;
-    pkt.u.hdr.flags = HEADER_DATA;
+    pkt.u.hdr.flags = HEADER_DATA | HEADER_MAX_DATA;
     pkt.u.hdr.id = stream->remote_id;
     pkt.u.hdr.pnum = stream->snd_next_pnum;
     pkt.u.hdr.data_offset = offset;
@@ -468,6 +467,8 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
     iov[0].iov_len = PROTO_DATA_HEADER_SIZE;
     iov[1].iov_base = sacks;
     iov[1].iov_len = nsacks * sizeof(sack_t);
+    iov[2].iov_base = &max_data;
+    iov[2].iov_len = PROTO_MAX_DATA_FIELD_SIZE;
 
     // new data needs a packet before the send, so a failed allocation
     // commits nothing
@@ -511,6 +512,11 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
         return -1;
     }
 
+    // the loop's time is from when epoll returned, which can be a burst of
+    // sends earlier. send_ts, pacing and the pto start from when this packet
+    // left
+    time_update();
+
     // END is on the wire, and in pbuf, so it's retransmitted if lost
     if (pkt.u.hdr.flags & HEADER_END &&
         stream->send_state == SEND_STATE_END_QUEUED) {
@@ -524,19 +530,41 @@ static ssize_t stream_send_data_packet(stream_t *stream, chain_t *chain,
     } else {
         p->len = len;
         p->chain = first;
-        inflight_append(stream, p);
+
+        p->next = NULL;
+        p->pprev = stream->plast_inflight;
+        *stream->plast_inflight = p;
+        stream->plast_inflight = &p->next;
+    }
+
+    // nothing in flight: the sampling interval starts now, not at the last
+    // ack
+    if (stream->inflight_bytes == 0) {
+        stream->first_send_ts = now_ts;
+        stream->delivered_ts = now_ts;
     }
 
     p->u = pkt.u;
-    p->sent_ts = now_ts;
+    p->send_ts = now_ts;
     p->lost = false;
 
     pbuf_set(&stream->packets, p);
 
     stream->snd_next_pnum++;
     stream->snd_inflight++;
+    stream->inflight_bytes += p->len;
+
+    // bbr draft 4.1.2.2 OnPacketSent: snapshot the delivery state, for the
+    // rate sample built when this packet is acked
+    p->P.delivered_bytes = stream->delivered_bytes;
+    p->P.lost_bytes = stream->lost_bytes;
+    p->P.delivered_ts = stream->delivered_ts;
+    p->P.first_send_ts = stream->first_send_ts;
+    p->P.is_app_limited = stream->app_limited != 0;
+    p->P.tx_in_flight_bytes = stream->inflight_bytes; // includes this packet
 
     stream->snd_last_ts = now_ts;
+    pacing_on_send(stream, len);
     stream_set_pto(stream);
 
     // this packet carried our acks
@@ -578,6 +606,8 @@ static void stream_pto_handler(event_t *ev) {
     socket_t *sock = ev->data;
     stream_t *stream = sock->stream;
 
+    bbr_check_app_limited(stream);
+
     // lost packets are a prefix of pbuf, so the first one that isn't lost
     // is the oldest in flight. marking it keeps the prefix
     for (uint32_t pnum = stream->snd_unacked; pnum != stream->snd_next_pnum;
@@ -587,7 +617,10 @@ static void stream_pto_handler(event_t *ev) {
         if (pkt != NULL && !pkt->lost) {
             pkt->lost = true;
             stream->lost += 1;
+            stream->lost_bytes += pkt->len;
+            bbr_on_packet_lost(stream, pkt);
             stream->snd_inflight -= 1;
+            stream->inflight_bytes -= pkt->len;
             break;
         }
     }
@@ -600,15 +633,69 @@ static void stream_pto_handler(event_t *ev) {
     event_post(&stream->push);
 }
 
+// the push timer serves both the ack delay and pacing, so keep whichever
+// deadline is sooner
+static void push_timer_start(event_t *ev, uint32_t timer_us) {
+    uint32_t key = (uint32_t)now_ts + timer_us;
+
+    if (!ev->timer_set || (int32_t)(ev->timer.key - key) > 0) {
+        timer_start(ev, timer_us);
+    }
+}
+
+// bbr draft 5.6.2 pacing. each data packet pushes snd_next_ts_nanoseconds
+// out by its share of the pacing rate. a packet may leave while
+// snd_next_ts_nanoseconds is at most a send quantum ahead of now, so packets
+// go out in bursts of up to a quantum. returns 0 if a packet may leave now,
+// else the us until the schedule catches up, so the next wakeup gets a whole
+// quantum
+static uint32_t pacing_delay(stream_t *stream) {
+    uint64_t rate = stream->bbr.pacing_rate;
+
+    if (rate == 0) {
+        return 0;
+    }
+
+    uint64_t now_ns = now_ts * 1000;
+    uint64_t quantum_ns = (uint64_t)stream->snd_quantum * PROTO_MAX_DATA * 1000000000 / rate;
+
+    if (stream->snd_next_ts_nanoseconds <= now_ns + quantum_ns) {
+        return 0;
+    }
+
+    uint64_t delay_us = (stream->snd_next_ts_nanoseconds - now_ns + 999) / 1000;
+
+    // timer deadlines compare as int32. a longer delay would land in the past
+    return delay_us < INT32_MAX ? delay_us : INT32_MAX;
+}
+
+static void pacing_on_send(stream_t *stream, size_t len) {
+    uint64_t rate = stream->bbr.pacing_rate;
+    uint64_t now_ns = now_ts * 1000;
+
+    if (rate == 0) {
+        return;
+    }
+
+    // after idle the schedule starts from now. no credit saved up
+    if (stream->snd_next_ts_nanoseconds < now_ns) {
+        stream->snd_next_ts_nanoseconds = now_ns;
+    }
+
+    stream->snd_next_ts_nanoseconds += len * 1000000000 / rate;
+}
+
 // nginx: ngx_quic_push_handler + ngx_quic_output
 // retransmit lost packets, then send new data, until the window is full,
-// there's nothing left, or the socket returns EAGAIN. every data packet
-// carries our ack state. if acks are still owed after that, send or delay an
-// ack-only packet. the stream state only advances once a send succeeds
+// there's nothing left, pacing holds the next packet, or the socket returns
+// EAGAIN. every data packet carries our ack state. if acks are still owed
+// after that, send or delay an ack-only packet. the stream state only
+// advances once a send succeeds
 static void stream_push_handler(event_t *ev) {
     socket_t *sock = ev->data;
     stream_t *stream = sock->stream;
     event_t *wev = sock->write;
+    uint32_t paced_us = 0; // pacing stopped sending, come back after this
 
     // loss is monotone in pnum, older packets are lost first, so the lost
     // packets are a prefix of the ones still in pbuf. each is resent under a
@@ -624,6 +711,10 @@ static void stream_push_handler(event_t *ev) {
                 break;
             }
 
+            if ((paced_us = pacing_delay(stream)) > 0) {
+                break;
+            }
+
             // it already left snd_inflight when it was marked lost
             if (stream_send_data_packet(stream, pkt->chain,
                                         pkt->u.hdr.data_offset, pkt->len,
@@ -636,7 +727,8 @@ static void stream_push_handler(event_t *ev) {
         stream->snd_unacked = pnum + 1;
     }
 
-    while (wev->ready && stream->snd_inflight < stream->max_inflight) {
+    while (wev->ready && paced_us == 0 &&
+           stream->snd_inflight < stream->max_inflight) {
         // the first link with unsent bytes, pos..last, holds snd_next_offset.
         // links before it are sent and waiting for acks
         chain_t *cl = stream->write_queue;
@@ -660,8 +752,23 @@ static void stream_push_handler(event_t *ev) {
         assert(cl->offset + (cl->buf->pos - cl->buf->start) ==
                stream->snd_next_offset);
 
+        // the peer drops data past its window. wait for it to advertise more
+        if (stream->snd_next_offset >= stream->snd_max_offset) {
+            break;
+        }
+
         uint64_t unsent = stream->snd_write_offset - stream->snd_next_offset;
+        uint64_t window = stream->snd_max_offset - stream->snd_next_offset;
+
+        if (unsent > window) {
+            unsent = window;
+        }
+
         size_t limit = unsent < PROTO_MAX_DATA ? unsent : PROTO_MAX_DATA;
+
+        if ((paced_us = pacing_delay(stream)) > 0) {
+            break;
+        }
 
         ssize_t n = stream_send_data_packet(stream, cl, stream->snd_next_offset,
                                             limit, NULL);
@@ -685,6 +792,16 @@ static void stream_push_handler(event_t *ev) {
         }
     }
 
+    // the cwnd, not the data or the socket, stopped sending
+    if (wev->ready && stream->snd_inflight >= stream->max_inflight &&
+        stream->snd_next_offset < stream->snd_write_offset) {
+        stream->is_max_inflight_limited = true;
+    }
+
+    if (paced_us > 0) {
+        push_timer_start(ev, paced_us);
+    }
+
     // nginx: ngx_quic_generate_ack
     // nothing carried the ack. send it alone if enough packets or time has
     // built up, otherwise come back when the delay runs out
@@ -693,9 +810,7 @@ static void stream_push_handler(event_t *ev) {
 
         if (stream->ack_pending < ACK_GAP && delay < MAX_ACK_DELAY_US) {
             // if it fires after an ack went out, push just finds nothing to do
-            if (!ev->timer_set) {
-                timer_start(ev, MAX_ACK_DELAY_US - delay);
-            }
+            push_timer_start(ev, MAX_ACK_DELAY_US - delay);
             return;
         }
 
@@ -1050,7 +1165,55 @@ static bool sack_validate(stream_t *stream, uint32_t *start, uint32_t end) {
     return true;
 }
 
-static void remove_packet(stream_t *stream, uint32_t pnum) {
+// bbr draft 4.1.2.3 UpdateRateSample, for each packet an ack newly acks. the
+// newest one sets the sampling interval
+static void rate_sample_update(stream_t *stream, packet_t *pkt, rate_sample_t *rs) {
+
+    rs->new_acked_bytes += pkt->len;
+
+    if (!rs->has_data || seq_diff(pkt->u.hdr.pnum, rs->last_acked_pnum) > 0) {
+        rs->has_data = true;
+        rs->prior_delivered_bytes = pkt->P.delivered_bytes;
+        rs->prior_lost_bytes = pkt->P.lost_bytes;
+        rs->prior_ts = pkt->P.delivered_ts;
+        rs->is_app_limited = pkt->P.is_app_limited;
+        rs->tx_in_flight_bytes = pkt->P.tx_in_flight_bytes;
+        rs->send_elapsed_us = pkt->send_ts - pkt->P.first_send_ts;
+        rs->ack_elapsed_us = stream->delivered_ts - pkt->P.delivered_ts;
+        rs->last_acked_pnum = pkt->u.hdr.pnum;
+        stream->first_send_ts = pkt->send_ts;
+    }
+}
+
+// bbr draft 4.1.2.3 GenerateRateSample, once the ack's packets are removed
+// and its losses marked
+static void rate_sample_generate(stream_t *stream, rate_sample_t *rs) {
+
+    // the app-limited bubble is acked and gone
+    if (stream->app_limited && stream->delivered_bytes > stream->app_limited) {
+        stream->app_limited = 0;
+    }
+
+    // nothing delivered on this ack
+    if (!rs->has_data) {
+        return;
+    }
+
+    rs->interval_us = max_uint32(rs->send_elapsed_us, rs->ack_elapsed_us);
+    rs->delivered_bytes = stream->delivered_bytes - rs->prior_delivered_bytes;
+    rs->lost_bytes = stream->lost_bytes - rs->prior_lost_bytes;
+
+    // under an rtt means the acks were compressed. the rate would be too high
+    if (rs->interval_us < stream->min_rtt_us) {
+        return;
+    }
+
+    if (rs->interval_us != 0) {
+        rs->delivery_rate = rs->delivered_bytes * 1000000 / rs->interval_us;
+    }
+}
+
+static void remove_packet(stream_t *stream, uint32_t pnum, rate_sample_t *rs) {
     packet_t *pkt = pbuf_remove(&stream->packets, pnum);
 
     // acked before, or resent under a new pnum
@@ -1061,27 +1224,39 @@ static void remove_packet(stream_t *stream, uint32_t pnum) {
     // a lost packet already left snd_inflight
     if (!pkt->lost) {
         stream->snd_inflight -= 1;
+        stream->inflight_bytes -= pkt->len;
     }
 
     stream->delivered += 1;
+    stream->delivered_bytes += pkt->len;
+    stream->delivered_ts = now_ts;
+
+    rate_sample_update(stream, pkt, rs);
 
     inflight_unlink(stream, pkt);
     packet_free(stream, pkt);
 }
 
-static uint32_t detect_loss(stream_t *stream);
+static uint32_t detect_loss(stream_t *stream, rate_sample_t *rs);
 
-static uint32_t stream_process_ack(stream_t *stream, uint32_t max_ack, sack_t *sacks, int nsacks) {
+static uint32_t stream_process_ack(stream_t *stream, uint32_t max_ack, sack_t *sacks, int nsacks, rate_sample_t *rs) {
     uint32_t delivered = stream->delivered;
+
+    // bbr draft 4.1.2.3 InitRateSample. rtt_us 0 means no rtt sample
+
     // first, let's check to see if the highest acked packet is newly transmitted,
     // if so generate an rtt sample
     packet_t *pkt = pbuf_get(&stream->packets, max_ack - 1);
     if (pkt) {
-        uint32_t rtt_us = now_ts - pkt->sent_ts;
+        uint32_t rtt_us = now_ts - pkt->send_ts;
         if (rtt_us == 0) {
             rtt_us = 1;
         }
         stream->latest_rtt_us = rtt_us;
+        rs->rtt_us = rtt_us;
+        if (stream->min_rtt_us == 0 || rtt_us < stream->min_rtt_us) {
+            stream->min_rtt_us = rtt_us;
+        }
         // win_filter_apply_min(&stream->rtt_min, time, rtt_us);
         if (stream->srtt_us == 0) {
             stream->srtt_us = rtt_us;
@@ -1101,7 +1276,7 @@ static uint32_t stream_process_ack(stream_t *stream, uint32_t max_ack, sack_t *s
         // pnums. ack-only packets use pnums without entering pbuf, so this
         // is common: the peer's data crosses our ack-only packets
         for (uint32_t p = stream->snd_unacked; seq_diff(max_ack, p) > 0; p++) {
-            remove_packet(stream, p);
+            remove_packet(stream, p, rs);
         }
     } else {
         for (sack_t *sack = sacks; sack < sacks + nsacks; sack += 1) {
@@ -1109,7 +1284,7 @@ static uint32_t stream_process_ack(stream_t *stream, uint32_t max_ack, sack_t *s
             uint32_t end = sack->end;
             if (sack_validate(stream, &start, end)) {
                 for (uint32_t p = start; p != end; p++) {
-                    remove_packet(stream, p);
+                    remove_packet(stream, p, rs);
                 }
             }
         }
@@ -1141,12 +1316,12 @@ static uint32_t stream_process_ack(stream_t *stream, uint32_t max_ack, sack_t *s
     return delivered;
 }
 
-static uint32_t detect_loss(stream_t *stream) {
+static uint32_t detect_loss(stream_t *stream, rate_sample_t *rs) {
     uint32_t lost = stream->lost;
     for (uint32_t pnum = stream->snd_unacked; seq_diff(pnum, stream->snd_max_ack) < 0; pnum++) {
         packet_t *pkt = pbuf_get(&stream->packets, pnum);
         if (pkt) {
-            uint32_t delta_us = now_ts - pkt->sent_ts;
+            uint32_t delta_us = now_ts - pkt->send_ts;
             if (pkt->lost) {
                 continue;
             }
@@ -1156,7 +1331,11 @@ static uint32_t detect_loss(stream_t *stream) {
             if (seq_diff(stream->snd_max_ack, pnum) > 3 || delta_us > rtt_us + rtt_us / 8) {
                 pkt->lost = true;
                 stream->lost += 1;
+                stream->lost_bytes += pkt->len;
+                bbr_on_packet_lost(stream, pkt);
+                rs->new_lost_bytes += pkt->len;
                 stream->snd_inflight -= 1;
+                stream->inflight_bytes -= pkt->len;
             }
         }
     }
@@ -1366,10 +1545,15 @@ static int stream_process_packet(stream_t *stream, uint8_t *data, ssize_t len, p
     // tcp 9293 - ack processing
     // ack already validated
 
+    bbr_check_app_limited(stream);
+
+    rate_sample_t rs = {0};
     uint32_t lost = 0;
-    uint32_t delivered = stream_process_ack(stream, max_ack, sacks, nsacks);
+    uint32_t delivered = stream_process_ack(stream, max_ack, sacks, nsacks, &rs);
     if (delivered) {
-        lost = detect_loss(stream);
+        lost = detect_loss(stream, &rs);
+        rate_sample_generate(stream, &rs);
+        bbr_congestion_control(stream, &rs);
 
         // the peer is getting our packets, so the path is fine. rfc 9002
         // resets the backoff on any ack, but an ack of nothing new may be
@@ -1389,6 +1573,9 @@ static int stream_process_packet(stream_t *stream, uint8_t *data, ssize_t len, p
 
     if (type & HEADER_MAX_DATA && new_max_offset > stream->snd_max_offset) {
         stream->snd_max_offset = new_max_offset;
+
+        // the window opened, there may be data waiting for it
+        event_post(&stream->push);
     }
 
     if (type & HEADER_DATA) {
@@ -1447,6 +1634,10 @@ static void stream_read_handler(event_t *rev) {
             rev->ready = 0;
             return;
         }
+
+        // the time this packet was read, not when the drain started. rtt
+        // samples and the rate sampler's ack times use it
+        time_update();
 
         stream_process_packet(stream, recv_buf, n, &pinfo);
 
