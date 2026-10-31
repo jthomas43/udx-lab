@@ -103,7 +103,7 @@ struct socket_s {
 #define HEADER_END 0x02
 #define HEADER_DESTROY 0x04
 #define HEADER_MESSAGE 0x08
-#define HEADER_PING 0x10
+#define HEADER_PING 0x10 // elicits an ack
 #define HEADER_PADDING 0x20
 #define HEADER_MAX_DATA 0x40
 #define HEADER_DATA_BLOCKED 0x80
@@ -286,6 +286,7 @@ struct stream_s {
 
     event_t push; // nginx: qc->push. all sending happens in its handler
     event_t pto;
+    event_t deliver; // posted by stream_read_start, delivers what rcv_buf holds
 
     uint32_t delivered;       // packets acked
     uint32_t lost;            // packets marked lost
@@ -304,8 +305,18 @@ struct stream_s {
     // limit on incoming data: the advertised window, or the final size once
     // END is received. a window update must not raise it after END
     uint64_t rcv_max_offset;
+    uint64_t rcv_max_offset_sent; // the rcv_max_offset our last packet carried
 
-    // out-of-order data in rcv_buf, sorted, not overlapping or touching
+    // a window update that went out alone, in a HEADER_PING packet so the
+    // peer acks it. every later packet carries a window at least as large,
+    // so an ack of it or of anything after it means the peer has it
+    uint32_t max_data_pnum;
+    uint64_t max_data_ts;
+    bool max_data_unacked;
+    bool max_data_pending; // the pto found it unacked, push sends it again
+
+    // data in rcv_buf waiting for the user: out of order, or in order while
+    // reading is stopped. sorted, not overlapping or touching
     range_t rcv_ranges[MAX_RCV_RANGES];
     uint32_t nrcv_ranges;
 
@@ -322,7 +333,7 @@ struct stream_s {
     uint32_t min_rtt_us; // over the stream's lifetime, 0 until the first sample
     uint32_t pto_us;
     uint32_t pto_count;   // ptos since the last ack of new data, for backoff
-    uint64_t snd_last_ts; // when the last data packet went out
+    uint64_t snd_last_ts; // when the last ack-eliciting packet went out
 
     struct {
         enum { BBR_STARTUP,
@@ -405,7 +416,8 @@ struct stream_s {
     } bbr;
 
     stream_read_cb user_read;
-    void *data; // the user's
+    bool read_stopped; // stream_read_stop. data waits in rcv_buf
+    void *data;        // the user's
 };
 
 #define MAX_EVENTS 512
@@ -444,6 +456,8 @@ stream_t *stream_create(socket_t *sock, uint32_t id, uint32_t remote_id, sockadd
                         sockaddr_t *local);
 int stream_write(write_t *w, stream_t *stream, byte_buf_t b, stream_ack_cb on_ack);
 int stream_write_end(write_t *w, stream_t *stream, byte_buf_t b, stream_ack_cb on_ack);
+void stream_read_stop(stream_t *stream);
+void stream_read_start(stream_t *stream);
 
 int socket_send(socket_t *sock, sockaddr_t *dst, byte_buf_t b);
 void socket_close(socket_t *socket);

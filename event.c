@@ -236,6 +236,10 @@ void socket_close(socket_t *sock) {
 
         // same for pto, it's never posted
         timer_stop(&sock->stream->pto);
+
+        if (sock->stream->deliver.posted) {
+            delete_posted_event(&sock->stream->deliver);
+        }
     }
 
     socket_free(sock->loop, sock);
